@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { createClient } from '@supabase/supabase-js'
+import { sendADFLead } from '../../lib/adf'
 
 const VERIFY_TOKEN = 'adcommand_verify_token'
 
@@ -38,7 +39,7 @@ export async function POST(request: NextRequest) {
               }
             }
 
-            await supabase.from('leads').insert({
+            const lead = {
               name: fieldData['full_name'] || fieldData['name'] || '',
               email: fieldData['email'] || '',
               phone: fieldData['phone_number'] || fieldData['phone'] || '',
@@ -46,7 +47,13 @@ export async function POST(request: NextRequest) {
               page_id: leadData.page_id || '',
               status: 'new',
               raw_payload: leadData
-            })
+            }
+
+            // Save to Supabase
+            await supabase.from('leads').insert(lead)
+
+            // Send ADF/XML to DealerSocket
+            await sendADFLead(lead)
           }
         }
       }
