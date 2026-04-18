@@ -50,7 +50,7 @@ export async function POST(request: NextRequest) {
             }
 
             // Save to Supabase
-            await supabase.from('leads').insert(lead)
+            await supabase.from('Leads').insert(lead)
 
             // Send ADF/XML to DealerSocket
             await sendADFLead(lead)
