@@ -9,6 +9,14 @@ const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
 )
 
+async function fetchLeadData(leadgenId: string) {
+  const token = process.env.FACEBOOK_PAGE_ACCESS_TOKEN
+  const url = `https://graph.facebook.com/v25.0/${leadgenId}?access_token=${token}`
+  const response = await fetch(url)
+  const data = await response.json()
+  return data
+}
+
 export async function GET(request: NextRequest) {
   const searchParams = request.nextUrl.searchParams
   const mode = searchParams.get('hub.mode')
@@ -31,10 +39,14 @@ export async function POST(request: NextRequest) {
         for (const change of entry.changes) {
           if (change.field === 'leadgen') {
             const leadData = change.value
+            const leadgenId = leadData.leadgen_id
+
+            // Fetch full lead data from Facebook
+            const fullLead = await fetchLeadData(leadgenId)
             const fieldData: Record<string, string> = {}
 
-            if (leadData.field_data) {
-              for (const field of leadData.field_data) {
+            if (fullLead.field_data) {
+              for (const field of fullLead.field_data) {
                 fieldData[field.name] = field.values[0]
               }
             }
@@ -46,7 +58,7 @@ export async function POST(request: NextRequest) {
               form_id: leadData.form_id || '',
               page_id: leadData.page_id || '',
               status: 'new',
-              raw_payload: leadData
+              raw_payload: fullLead
             }
 
             // Save to Supabase
