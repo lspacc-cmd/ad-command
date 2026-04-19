@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { createClient } from '@supabase/supabase-js'
 import { sendADFLead } from '../../lib/adf'
+import { generateLeadResponse } from '../../lib/ai'
 
 const VERIFY_TOKEN = 'adcommand_verify_token'
 
@@ -66,6 +67,13 @@ export async function POST(request: NextRequest) {
 
             // Send ADF/XML to DealerSocket
             await sendADFLead(lead)
+
+            // Generate AI follow-up message
+            const aiMessage = await generateLeadResponse(lead)
+            if (aiMessage) {
+              console.log('AI follow-up generated:', aiMessage)
+              // Next step: send via Facebook Messenger
+            }
           }
         }
       }
