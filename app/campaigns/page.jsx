@@ -2,11 +2,6 @@
 
 import { useEffect, useState } from 'react'
 
-const AD_ACCOUNT_ID = 'act_448513050930740'
-const ACCESS_TOKEN = process.env.NEXT_PUBLIC_META_ACCESS_TOKEN
-
-const fields = 'campaign_name,spend,impressions,reach,clicks,cpc,cpm,cpp,ctr,actions,cost_per_action_type,video_avg_time_watched_actions,video_p25_watched_actions,video_p50_watched_actions,video_p75_watched_actions,video_p100_watched_actions'
-
 function getCPLColor(cpl) {
   if (!cpl) return 'gray'
   if (cpl < 15) return 'green'
@@ -40,10 +35,9 @@ export default function CampaignsPage() {
     setLoading(true)
     setError(null)
     try {
-      const url = `https://graph.facebook.com/v25.0/${AD_ACCOUNT_ID}/campaigns?fields=name,status,insights.date_preset(${dateRange}){${fields}}&access_token=${ACCESS_TOKEN}`
-      const res = await fetch(url)
+      const res = await fetch(`/api/campaigns?date_preset=${dateRange}`)
       const data = await res.json()
-      if (data.error) throw new Error(data.error.message)
+      if (data.error) throw new Error(data.error)
       setCampaigns(data.data || [])
     } catch (err) {
       setError(err.message)
@@ -91,8 +85,6 @@ export default function CampaignsPage() {
         const reach = parseInt(insights.reach || 0)
         const clicks = parseInt(insights.clicks || 0)
         const ctr = parseFloat(insights.ctr || 0)
-        const videoViews = getMetric(insights.actions, 'video_view')
-        const viewRate = impressions > 0 ? ((videoViews / impressions) * 100).toFixed(1) : 0
 
         return (
           <div key={campaign.id} style={{ background: 'white', borderRadius: '12px', padding: '20px', marginBottom: '16px', border: '1px solid #eee', boxShadow: '0 1px 4px rgba(0,0,0,0.06)' }}>
@@ -111,7 +103,6 @@ export default function CampaignsPage() {
               <Metric label="Reach" value={reach.toLocaleString()} />
               <Metric label="Clicks" value={clicks.toLocaleString()} />
               <Metric label="CTR" value={`${ctr.toFixed(2)}%`} />
-              <Metric label="Video View Rate" value={`${viewRate}%`} />
             </div>
           </div>
         )
