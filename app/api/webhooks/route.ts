@@ -12,11 +12,14 @@ const supabase = createClient(
 
 async function fetchLeadData(leadgenId: string) {
   const token = process.env.FACEBOOK_PAGE_ACCESS_TOKEN
-  const url = `https://graph.facebook.com/v25.0/${leadgenId}?access_token=${token}`
+  const url = `https://graph.facebook.com/v25.0/${leadgenId}?fields=field_data,created_time,ad_id,form_id,page_id&access_token=${token}`
+  console.log('Fetching lead data for:', leadgenId)
   const response = await fetch(url)
   const data = await response.json()
+  console.log('Lead data response:', JSON.stringify(data))
   return data
 }
+
 
 export async function GET(request: NextRequest) {
   const searchParams = request.nextUrl.searchParams
