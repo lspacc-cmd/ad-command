@@ -6,8 +6,11 @@ export async function sendADFLead(lead: {
   name: string
   email: string
   phone: string
-  campaign_id?: string
+  campaign_name?: string
 }) {
+  // Use the specific campaign name if provided, otherwise fall back to AD COMMAND
+  const campaignName = lead.campaign_name || 'AD COMMAND'
+
   const adfXml = `<?xml version="1.0" encoding="UTF-8"?>
 <?adf version="1.0"?>
 <adf>
@@ -29,7 +32,7 @@ export async function sendADFLead(lead: {
       <vendorname>Larry Spacc GMC</vendorname>
     </vendor>
     <provider>
-      <name>AD COMMAND</name>
+      <name>${campaignName}</name>
       <service>Facebook Lead Ads</service>
       <url>https://adcommand.one</url>
     </provider>
