@@ -134,6 +134,25 @@ export async function POST(request: NextRequest) {
             }
 
             console.log('Campaign resolved:', segmentInfo.campaignName)
+            // EMPLOYMENT FILTER — block CRM, email to Larry instead
+const EMPLOYMENT_CAMPAIGN_IDS = ['120248621105000017']
+if (EMPLOYMENT_CAMPAIGN_IDS.includes(adId)) {
+  const { Resend } = await import('resend')
+  const resend = new Resend(process.env.RESEND_API_KEY)
+  await resend.emails.send({
+    from: 'AD COMMAND <leads@adcommand.one>',
+    to: 'Lspacc@gmail.com',
+    subject: `New Job Applicant: ${lead.name}`,
+    html: `
+      <h2>New Employment Applicant</h2>
+      <p><strong>Name:</strong> ${lead.name}</p>
+      <p><strong>Email:</strong> ${lead.email}</p>
+      <p><strong>Phone:</strong> ${lead.phone}</p>
+      <p><strong>Submitted:</strong> ${new Date().toLocaleString()}</p>
+    `
+  })
+  continue
+}
 
             await supabase.from('Leads').insert(lead)
             await sendADFLead(lead)
