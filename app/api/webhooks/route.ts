@@ -105,7 +105,9 @@ export async function POST(request: NextRequest) {
             const fullLead = await fetchLeadData(leadgenId)
             const fieldData: Record<string, string> = {}
 
-            if (fullLead.field_data) {
+            if (fullLead.error) {
+              console.error('Graph API lead fetch failed for', leadgenId, ':', fullLead.error.message)
+            } else if (fullLead.field_data) {
               for (const field of fullLead.field_data) {
                 fieldData[field.name] = field.values[0]
               }
@@ -129,7 +131,7 @@ export async function POST(request: NextRequest) {
               ad_id: adId,
               campaign_name: segmentInfo.campaignName,
               ai_sequence: personalizedAiMessage,
-              status: 'new',
+              status: fullLead.error ? 'needs_review' : 'new',
               raw_payload: fullLead,
             }
 
@@ -154,7 +156,14 @@ if (EMPLOYMENT_CAMPAIGN_IDS.includes(adId)) {
   continue
 }
 
-            await supabase.from('Leads').insert(lead)
+            const { campaign_name, ...leadForDb } = lead
+            const { error: insertError } = await supabase
+              .from('Leads')
+              .insert({ ...leadForDb, campaign_id: campaign_name })
+            if (insertError) {
+              console.error('Supabase Leads insert error:', insertError.message)
+            }
+
             await sendADFLead(lead)
 
             const aiMessage = await generateLeadResponse(lead)
