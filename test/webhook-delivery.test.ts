@@ -277,6 +277,74 @@ test('a rejected send can be retried once, and a later success is not repeated',
   assert.equal(sent.calls[0].key, sent.calls[1].key)
 })
 
+test('an expired ambiguous attempt is not sent again', async () => {
+  let current = 0
+  const sent = mailer(async () => ({ kind: 'ambiguous', detail: 'unresolved' }))
+  const used = deps({
+    mailer: sent,
+    store: createMemoryDeliveryStore({ now: () => current }),
+  })
+  const first = await processMetaWebhook(notice('7101'), used)
+  current = 24 * 60 * 60 * 1000
+  const second = await processMetaWebhook(notice('7101'), used)
+  assert.equal(first.status, 503)
+  assert.equal(second.status, 200)
+  assert.equal(sent.calls.length, 1)
+  assert.equal((await used.store.claim('7101')).outcome, 'needs_review')
+})
+
+test('a definite provider rejection can still send after 24 hours', async () => {
+  let current = 0
+  let attempt = 0
+  const sent = mailer(async () => {
+    attempt += 1
+    if (attempt === 1) return { kind: 'rejected', detail: '422:validation_error' }
+    return { kind: 'sent', id: 'email_after_rejection' }
+  })
+  const used = deps({
+    mailer: sent,
+    store: createMemoryDeliveryStore({ now: () => current }),
+  })
+  const rejected = await processMetaWebhook(notice('7102'), used)
+  current = 25 * 60 * 60 * 1000
+  const delivered = await processMetaWebhook(notice('7102'), used)
+  assert.equal(rejected.status, 503)
+  assert.equal(delivered.status, 200)
+  assert.equal(sent.calls.length, 2)
+})
+
+test('an ambiguous attempt still retries inside the 24 hour window', async () => {
+  let current = 0
+  const accepted = new Map<string, string>()
+  const sent = mailer(async (message, key) => {
+    const prior = accepted.get(key)
+    if (!prior) {
+      accepted.set(key, JSON.stringify(message))
+      return { kind: 'ambiguous', detail: 'unresolved' }
+    }
+    return { kind: 'sent', id: 'email_inside_window' }
+  })
+  const used = deps({
+    mailer: sent,
+    store: createMemoryDeliveryStore({ now: () => current }),
+  })
+  await processMetaWebhook(notice('7103'), used)
+  current = 23 * 60 * 60 * 1000
+  const recovered = await processMetaWebhook(notice('7103'), used)
+  assert.equal(recovered.status, 200)
+  assert.equal(sent.calls.length, 2)
+  assert.equal(sent.calls[0].key, sent.calls[1].key)
+})
+
+test('a send is withheld when the attempt time cannot be recorded', async () => {
+  const store = createMemoryDeliveryStore()
+  store.noteMailAttempt = async () => false
+  const sent = mailer()
+  const result = await processMetaWebhook(notice('7104'), deps({ store, mailer: sent }))
+  assert.equal(result.status, 503)
+  assert.equal(sent.calls.length, 0)
+})
+
 test('an ambiguous timeout retries the same key and the same body', async () => {
   const accepted = new Map<string, { id: string; payload: string }>()
   const sent = mailer(async (message, key) => {
@@ -494,6 +562,9 @@ test('unapplied migration is a service-role ledger without contact columns', () 
   assert.match(sql, /security definer/)
   assert.match(sql, /grant select on table public\.meta_lead_deliveries to service_role/)
   assert.match(sql, /grant execute on function public\.claim_meta_lead_delivery\(text\) to service_role/)
+  assert.match(sql, /mail_attempted_at timestamptz/)
+  assert.match(sql, /interval '24 hours'/)
+  assert.match(sql, /grant execute on function public\.note_mail_attempt\(text, uuid\) to service_role/)
   assert.doesNotMatch(sql, /\bemail\b/i)
   assert.doesNotMatch(sql, /\bphone\b/i)
   const seed = readFileSync(new URL('../supabase/unapplied/seed-manual-leadgen-ids.EXAMPLE.sql', import.meta.url), 'utf8')

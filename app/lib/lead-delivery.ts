@@ -8,10 +8,12 @@
  * (https://resend.com/docs/dashboard/emails/idempotency-keys). The installed
  * SDK (resend 6.x) sends that key as the second-argument option, which sets
  * the Idempotency-Key header. A timeout can hide whether Resend accepted the
- * message; the retry uses the same key and the same body. After 24 hours a
- * retry whose database row never reached "sent" or "suppressed" can deliver
- * a second email. A 409 invalid_idempotent_request means this key was already
- * used with a different body, so the code does not mint a new key.
+ * message; the retry uses the same key and the same body. The attempt time is
+ * stored before that call. Once 24 hours have passed, an ambiguous attempt is
+ * marked needs_review and is not sent again. A definite provider rejection
+ * clears the attempt time so a later retry can still send. A 409
+ * invalid_idempotent_request means this key was already used with a different
+ * body, so the code does not mint a new key.
  */
 
 import { createClient, type SupabaseClient } from '@supabase/supabase-js'
@@ -23,6 +25,7 @@ export const ADF_FROM = 'leads@adcommand.one'
 export const RECRUITING_FROM = 'AD COMMAND <leads@adcommand.one>'
 
 export const CLAIM_LEASE_MS = 2 * 60 * 1000
+export const RESEND_IDEMPOTENCY_WINDOW_MS = 24 * 60 * 60 * 1000
 
 export const RECRUITING_FORM_NAMES = ['Auto Tech Apply', 'Auto Tech Apply v2'] as const
 
@@ -81,7 +84,7 @@ export type FormClass = 'recruiting' | 'sales' | 'unknown'
 export type ClaimResult =
   | { outcome: 'claimed'; claimToken: string }
   | { outcome: 'already_settled'; status: 'sent' | 'suppressed' }
-  | { outcome: 'needs_review' }
+  | { outcome: 'needs_review'; reason: string | null }
   | { outcome: 'in_flight' }
 
 export type DeliveryStatus = 'sent' | 'suppressed' | 'retryable' | 'needs_review'
@@ -101,6 +104,7 @@ export type CompleteInput = {
 
 export interface DeliveryStore {
   claim(leadgenId: string): Promise<ClaimResult>
+  noteMailAttempt(leadgenId: string, claimToken: string): Promise<boolean>
   complete(input: CompleteInput): Promise<boolean>
 }
 
@@ -181,6 +185,7 @@ type MemoryRow = {
   resendId: string | null
   idempotencyKey: string | null
   lastError: string | null
+  mailAttemptedAt: number | null
 }
 
 export function escapeXml(value: string): string {
@@ -335,9 +340,19 @@ export function createSupabaseDeliveryStore(client: RpcClient): DeliveryStore {
       if (outcome === 'already_settled' && (row?.status === 'sent' || row?.status === 'suppressed')) {
         return { outcome: 'already_settled', status: row.status }
       }
-      if (outcome === 'needs_review') return { outcome: 'needs_review' }
+      if (outcome === 'needs_review') {
+        return { outcome: 'needs_review', reason: typeof row?.last_error === 'string' ? row.last_error : null }
+      }
       if (outcome === 'in_flight') return { outcome: 'in_flight' }
       throw new Error('delivery_store_claim_unreadable')
+    },
+    async noteMailAttempt(leadgenId, claimToken) {
+      const { data, error } = await client.rpc('note_mail_attempt', {
+        p_leadgen_id: leadgenId,
+        p_claim_token: claimToken,
+      })
+      if (error) throw new Error('delivery_store_attempt_failed')
+      return data === true
     },
     async complete(input) {
       const { data, error } = await client.rpc('complete_meta_lead_delivery', {
@@ -398,6 +413,7 @@ export function createMemoryDeliveryStore(options?: { now?: () => number; leaseM
             resendId: null,
             idempotencyKey: null,
             lastError: null,
+            mailAttemptedAt: null,
           }
           rows.set(leadgenId, row)
           return { outcome: 'claimed' as const, claimToken: row.claimToken }
@@ -405,7 +421,16 @@ export function createMemoryDeliveryStore(options?: { now?: () => number; leaseM
         if (row.status === 'sent' || row.status === 'suppressed') {
           return { outcome: 'already_settled' as const, status: row.status }
         }
-        if (row.status === 'needs_review') return { outcome: 'needs_review' as const }
+        if (row.status === 'needs_review') return { outcome: 'needs_review' as const, reason: row.lastError }
+        const ambiguous = (row.lastError || '').startsWith('ambiguous:')
+        const attemptExpired = row.mailAttemptedAt != null && current >= row.mailAttemptedAt + RESEND_IDEMPOTENCY_WINDOW_MS
+        const ambiguousClosed = row.status === 'retryable' && ambiguous && (row.mailAttemptedAt == null || attemptExpired)
+        const staleAttemptClosed = row.status === 'claimed' && current >= row.claimedAt + leaseMs && attemptExpired
+        if (ambiguousClosed || staleAttemptClosed) {
+          row.status = 'needs_review'
+          row.lastError = 'idempotency_window_expired'
+          return { outcome: 'needs_review' as const, reason: row.lastError }
+        }
         const staleClaim = row.status === 'claimed' && current >= row.claimedAt + leaseMs
         if (row.status === 'retryable' || staleClaim) {
           row.status = 'claimed'
@@ -415,6 +440,14 @@ export function createMemoryDeliveryStore(options?: { now?: () => number; leaseM
           return { outcome: 'claimed' as const, claimToken: row.claimToken }
         }
         return { outcome: 'in_flight' as const }
+      })
+    },
+    noteMailAttempt(leadgenId, claimToken) {
+      return exclusive(() => {
+        const row = rows.get(leadgenId)
+        if (!row || row.status !== 'claimed' || row.claimToken !== claimToken) return false
+        if (row.mailAttemptedAt == null) row.mailAttemptedAt = now()
+        return true
       })
     },
     complete(input) {
@@ -428,6 +461,9 @@ export function createMemoryDeliveryStore(options?: { now?: () => number; leaseM
         row.resendId = input.resendId ?? row.resendId
         row.idempotencyKey = input.idempotencyKey
         row.lastError = input.lastError
+        if (input.status === 'retryable' && (input.lastError || '').startsWith('rejected:')) {
+          row.mailAttemptedAt = null
+        }
         return true
       })
     },
@@ -699,11 +735,23 @@ async function processNotice(notice: LeadgenNotice, deps: WebhookDeps): Promise<
     return true
   }
   if (claim.outcome === 'already_settled' || claim.outcome === 'needs_review') {
-    logEvent('info', claim.outcome === 'needs_review' ? 'needs_review' : 'duplicate', leadgenId)
+    logEvent('info', claim.outcome === 'needs_review' ? (claim.reason || 'needs_review') : 'duplicate', leadgenId)
     return false
   }
   if (claim.outcome === 'in_flight') {
     logEvent('info', 'delivery_in_flight', leadgenId)
+    return true
+  }
+
+  let noted = false
+  try {
+    noted = await deps.store.noteMailAttempt(leadgenId, claim.claimToken)
+  } catch {
+    logEvent('error', 'delivery_store_attempt_failed', leadgenId)
+    return true
+  }
+  if (!noted) {
+    logEvent('error', 'mail_attempt_not_recorded', leadgenId)
     return true
   }
 
@@ -731,6 +779,7 @@ async function processNotice(notice: LeadgenNotice, deps: WebhookDeps): Promise<
   }
 
   if (mailed.kind !== 'sent') {
+    const ambiguous = mailed.kind === 'ambiguous' || mailed.kind === 'in_progress'
     const settled = await finishClaim(deps.store, {
       leadgenId,
       claimToken: claim.claimToken,
@@ -740,7 +789,7 @@ async function processNotice(notice: LeadgenNotice, deps: WebhookDeps): Promise<
       formName: salesLead.formName,
       resendId: null,
       idempotencyKey,
-      lastError: mailed.detail,
+      lastError: `${ambiguous ? 'ambiguous' : 'rejected'}:${mailed.detail}`,
     }, leadgenId)
     if (!settled) logEvent('error', 'delivery_store_complete_failed', leadgenId)
     logEvent('error', 'mail_not_accepted', leadgenId, mailed.detail)

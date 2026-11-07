@@ -10,8 +10,11 @@
 -- execute them. service_role can read the ledger and cannot insert, update, or
 -- delete it directly.
 --
--- Exactly-once is not guaranteed. Resend idempotency keys expire after 24 hours.
--- A retry whose row is still retryable after that window can deliver a second copy.
+-- An ambiguous provider attempt stores mail_attempted_at before the call.
+-- A later claim at or after 24 hours does not send again. It marks the row
+-- needs_review. A definite provider rejection clears that timestamp so a later
+-- retry can still send. RESEND_IDEMPOTENCY_WINDOW_MS in app/lib/lead-delivery.ts
+-- is the same 24 hour window.
 
 create extension if not exists pgcrypto;
 
@@ -26,6 +29,7 @@ create table if not exists public.meta_lead_deliveries (
   resend_id text,
   idempotency_key text,
   last_error text,
+  mail_attempted_at timestamptz,
   updated_at timestamptz not null default now()
 );
 
@@ -42,7 +46,8 @@ returns table (
   outcome text,
   claim_token uuid,
   status text,
-  resend_id text
+  resend_id text,
+  last_error text
 )
 language plpgsql
 security definer
@@ -94,23 +99,79 @@ begin
     claim_token := existing.claim_token;
     status := existing.status;
     resend_id := existing.resend_id;
+    last_error := existing.last_error;
     return next;
     return;
   end if;
 
+  -- Ambiguous attempts are not resent once Resend's 24 hour key has expired.
+  -- A missing attempt time on an ambiguous row also fails closed.
+  if existing.status = 'retryable'
+     and coalesce(existing.last_error, '') like 'ambiguous:%'
+     and (
+       existing.mail_attempted_at is null
+       or existing.mail_attempted_at <= now() - interval '24 hours'
+     ) then
+    update public.meta_lead_deliveries as ledger
+      set status = 'needs_review',
+          last_error = 'idempotency_window_expired',
+          updated_at = now()
+      where ledger.leadgen_id = p_leadgen_id
+        and ledger.claim_token = existing.claim_token
+        and ledger.status = 'retryable'
+      returning ledger.claim_token into inserted_token;
+
+    if inserted_token is not null then
+      outcome := 'needs_review';
+      claim_token := inserted_token;
+      status := 'needs_review';
+      resend_id := existing.resend_id;
+      last_error := 'idempotency_window_expired';
+      return next;
+      return;
+    end if;
+  end if;
+
+  -- A claim that already called the provider and then went stale is the same
+  -- ambiguity. After 24 hours it is manual review, not another send.
+  if existing.status = 'claimed'
+     and existing.claimed_at < now() - interval '2 minutes'
+     and existing.mail_attempted_at is not null
+     and existing.mail_attempted_at <= now() - interval '24 hours' then
+    update public.meta_lead_deliveries as ledger
+      set status = 'needs_review',
+          last_error = 'idempotency_window_expired',
+          updated_at = now()
+      where ledger.leadgen_id = p_leadgen_id
+        and ledger.claim_token = existing.claim_token
+        and ledger.status = 'claimed'
+      returning ledger.claim_token into inserted_token;
+
+    if inserted_token is not null then
+      outcome := 'needs_review';
+      claim_token := inserted_token;
+      status := 'needs_review';
+      resend_id := existing.resend_id;
+      last_error := 'idempotency_window_expired';
+      return next;
+      return;
+    end if;
+  end if;
+
   -- Same 2 minute lease as CLAIM_LEASE_MS in app/lib/lead-delivery.ts.
+  -- mail_attempted_at is intentionally left unchanged.
   if existing.status = 'retryable'
      or (existing.status = 'claimed' and existing.claimed_at < now() - interval '2 minutes') then
     new_token := gen_random_uuid();
-    update public.meta_lead_deliveries
+    update public.meta_lead_deliveries as ledger
       set status = 'claimed',
           claim_token = new_token,
           claimed_at = now(),
           updated_at = now(),
           last_error = null
-      where leadgen_id = p_leadgen_id
-        and claim_token = existing.claim_token
-      returning public.meta_lead_deliveries.claim_token into inserted_token;
+      where ledger.leadgen_id = p_leadgen_id
+        and ledger.claim_token = existing.claim_token
+      returning ledger.claim_token into inserted_token;
 
     if inserted_token is not null then
       outcome := 'claimed';
@@ -163,6 +224,33 @@ begin
         resend_id = coalesce(p_resend_id, resend_id),
         idempotency_key = p_idempotency_key,
         last_error = left(coalesce(p_last_error, ''), 500),
+        mail_attempted_at = case
+          when p_status = 'retryable' and coalesce(p_last_error, '') like 'rejected:%' then null
+          else mail_attempted_at
+        end,
+        updated_at = now()
+    where leadgen_id = p_leadgen_id
+      and claim_token = p_claim_token
+      and status = 'claimed';
+
+  get diagnostics updated_count = row_count;
+  return updated_count = 1;
+end;
+$function$;
+
+create or replace function public.note_mail_attempt(
+  p_leadgen_id text,
+  p_claim_token uuid
+) returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $function$
+declare
+  updated_count integer;
+begin
+  update public.meta_lead_deliveries
+    set mail_attempted_at = coalesce(mail_attempted_at, now()),
         updated_at = now()
     where leadgen_id = p_leadgen_id
       and claim_token = p_claim_token
@@ -175,5 +263,7 @@ $function$;
 
 revoke all on function public.claim_meta_lead_delivery(text) from public, anon, authenticated;
 revoke all on function public.complete_meta_lead_delivery(text, uuid, text, text, text, text, text, text, text) from public, anon, authenticated;
+revoke all on function public.note_mail_attempt(text, uuid) from public, anon, authenticated;
 grant execute on function public.claim_meta_lead_delivery(text) to service_role;
 grant execute on function public.complete_meta_lead_delivery(text, uuid, text, text, text, text, text, text, text) to service_role;
+grant execute on function public.note_mail_attempt(text, uuid) to service_role;
